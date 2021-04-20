@@ -26,6 +26,10 @@ To run the frontend project (after instaling the dependencies above):
 
 The source can be reviewed using your favourite text editor.
 
+# Note
+The API Key for Google is invalid, an API Key will be provided to you that you should use instead of the key defined in the `.env` file.
+If you have your own Google API Key feel free to use that.
+
 # Task
 1. Review both projects
 2. Have the solution running and working on your own laptop that you should bring with you to the technical interview sessions
