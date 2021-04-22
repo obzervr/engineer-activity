@@ -44,3 +44,6 @@ During the technical interview you will be asked to:
 
 # Note
 There may be areas of the system that you are more or less familiar with. Please point this out to your interviewer. There is no penalty for not being a React developer if your experience is with Angular or other JS frameworks. Having this knowledge will help to frame our questions and changes we suggest.
+
+# Quality Note
+The code in this activity is purposefully poor. It should be noted that the code in this activity should not be used as an insight into the quality of code, design or practices applied to production code at Obzervr.
