@@ -12,8 +12,15 @@
   Run -Setup before the candidate arrives, -Verify after adding the key on
   GitHub, and -Revoke immediately after the interview.
 
-  Deliberately does nothing destructive without -Revoke, and refuses to
-  overwrite an existing key or an unmanaged SSH config block.
+  -Setup is idempotent and safe to re-run. Every step either replaces only what
+  this script wrote or reuses what is already correct: an existing usable key is
+  reused rather than replaced, so a public half already registered on GitHub
+  stays valid; the pinned host key and the managed SSH config block are rewritten
+  in place; the git identity is set unconditionally. Re-running after a partial
+  failure finishes the remaining steps.
+
+  Deliberately does nothing destructive without -Revoke or -Force, and refuses to
+  touch an unmanaged SSH config block.
 
 .PARAMETER Setup
   Generate the key, pin the host key, write the SSH config block.
@@ -26,6 +33,10 @@
 
 .PARAMETER Revoke
   Remove the key, the config block and the pinned host key from this device.
+
+.PARAMETER Force
+  With -Setup, delete and regenerate an existing key instead of reusing it. The
+  old public half stops matching, so delete that deploy key on GitHub too.
 
 .PARAMETER Surname
   Candidate surname, used in the key filename and comment. Required except for -Verify.
@@ -45,6 +56,9 @@
   .\Prepare-InterviewDeployKey.ps1 -Verify -Repo obzervr/tech-interview.int-eng-smith
 .EXAMPLE
   .\Prepare-InterviewDeployKey.ps1 -Revoke -Surname smith
+.EXAMPLE
+  # Re-run after a partial failure: reuses the existing key, finishes the rest
+  .\Prepare-InterviewDeployKey.ps1 -Setup -Surname smith -Repo obzervr/tech-interview.int-eng-smith
 #>
 
 [CmdletBinding(DefaultParameterSetName = 'Setup')]
@@ -63,6 +77,7 @@ param(
   [ValidatePattern('^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$')]
   [string]$Repo,
 
+  [Parameter(ParameterSetName = 'Setup')][switch]$Force,
   [Parameter(ParameterSetName = 'Setup')][string]$CandidateName,
   [Parameter(ParameterSetName = 'Setup')][string]$CandidateEmail,
   [Parameter(ParameterSetName = 'Verify')][switch]$Clone
@@ -92,6 +107,36 @@ function Write-Step  { param($m) Write-Host "==> $m" -ForegroundColor Cyan }
 function Write-Ok    { param($m) Write-Host "    ok  $m" -ForegroundColor Green }
 function Write-Warn2 { param($m) Write-Host "    !!  $m" -ForegroundColor Yellow }
 function Fail        { param($m) Write-Host "    XX  $m" -ForegroundColor Red; exit 1 }
+
+<#
+  Runs a native command and returns its stdout lines, without letting stderr
+  turn into a terminating error.
+
+  Necessary because $ErrorActionPreference = 'Stop' makes PowerShell convert any
+  native-command stderr output into a NativeCommandError, and several of the SSH
+  tools write ordinary progress and banner text to stderr. ssh-keyscan, for
+  example, emits "# github.com:22 SSH-2.0-..." there on a completely successful
+  scan. A 2>$null redirect does not prevent it.
+#>
+function Invoke-Native {
+  param(
+    [Parameter(Mandatory)][string]$Command,
+    [string[]]$Arguments = @()
+  )
+  $previous = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try {
+    # 2>&1 merges stderr into the output stream; with EAP Continue it arrives as
+    # plain records rather than throwing. Callers filter what they need.
+    $raw = & $Command @Arguments 2>&1
+  } finally {
+    $ErrorActionPreference = $previous
+  }
+  [pscustomobject]@{
+    ExitCode = $LASTEXITCODE
+    Lines    = @($raw | ForEach-Object { $_.ToString() })
+  }
+}
 
 function Assert-OpenSsh {
   foreach ($tool in 'ssh-keygen', 'ssh-keyscan', 'ssh') {
@@ -124,28 +169,78 @@ function Invoke-Setup {
   Lock-ToCurrentUser $SshDir
   Write-Ok $SshDir
 
-  Write-Step "Generating the deploy keypair"
-  if (Test-Path $keys.Private) {
-    Fail "$($keys.Private) already exists. Run -Revoke for this surname first, or pick a different -Surname. Refusing to overwrite a key that may already be registered on a repository."
-  }
+  Write-Step "Deploy keypair"
   $comment = "interview-{0}-{1}" -f $Surname.ToLower(), (Get-Date -Format 'yyyyMM')
-  & ssh-keygen -t ed25519 -C $comment -f $keys.Private -N '""' | Out-Null
-  if ($LASTEXITCODE -ne 0 -or -not (Test-Path $keys.Private)) { Fail "ssh-keygen failed." }
-  Lock-ToCurrentUser $keys.Private
-  Write-Ok "$($keys.Private) (comment: $comment)"
+
+  if ($Force -and (Test-Path $keys.Private)) {
+    Remove-Item $keys.Private, $keys.Public -Force -ErrorAction SilentlyContinue
+    Write-Warn2 "-Force given: deleted the existing key. If it was already registered as a deploy key, delete that entry on GitHub too - it no longer matches."
+  }
+
+  if (Test-Path $keys.Private) {
+    # Re-running -Setup after a partial failure must not be blocked. Reuse a
+    # usable existing key rather than refusing, so a public half already
+    # registered on GitHub stays valid and the run can finish the remaining
+    # steps. Use -Force to deliberately start over.
+    $probe = Invoke-Native -Command 'ssh-keygen' -Arguments @('-y', '-P', '', '-f', $keys.Private)
+    if ($probe.ExitCode -ne 0) {
+      Fail "$($keys.Private) exists but cannot be read with an empty passphrase, so it is either passphrase-protected or damaged. Re-run with -Force to replace it (then delete the old deploy key on GitHub), or move the file aside. ssh-keygen said:`n        $($probe.Lines -join "`n        ")"
+    }
+    $derived = @($probe.Lines | Where-Object { $_ -like 'ssh-ed25519 *' })
+    if (-not (Test-Path $keys.Public) -and $derived.Count -gt 0) {
+      Set-Content -Path $keys.Public -Value $derived[0] -Encoding ascii
+      Write-Warn2 "the public half was missing and has been regenerated from the private key"
+    }
+    # Keep the title consistent with whatever is already registered.
+    if (Test-Path $keys.Public) {
+      $existingComment = ((Get-Content $keys.Public -First 1) -split '\s+', 3)[2]
+      if ($existingComment) { $comment = $existingComment.Trim() }
+    }
+    Lock-ToCurrentUser $keys.Private
+    Write-Ok "reusing the existing key (comment: $comment) - pass -Force to replace it"
+  }
+  else {
+    # -N '""' is the Windows PowerShell idiom for an empty passphrase: a bare -N ''
+    # gets dropped by the argument parser and ssh-keygen then eats the next token.
+    $gen = Invoke-Native -Command 'ssh-keygen' -Arguments @('-t', 'ed25519', '-C', $comment, '-f', $keys.Private, '-N', '""')
+    if ($gen.ExitCode -ne 0 -or -not (Test-Path $keys.Private)) {
+      Fail "ssh-keygen failed:`n        $($gen.Lines -join "`n        ")"
+    }
+    Lock-ToCurrentUser $keys.Private
+
+    # Prove the passphrase is actually empty rather than a literal two-character
+    # '""'. Depending on the PowerShell and OpenSSH pairing the quoting above can
+    # land either way, and a key with a passphrase does not fail here - it fails
+    # when git asks for it, mid-interview. -y derives the public key and needs the
+    # passphrase to do it, so an empty -P succeeding is the proof.
+    $probe = Invoke-Native -Command 'ssh-keygen' -Arguments @('-y', '-P', '', '-f', $keys.Private)
+    if ($probe.ExitCode -ne 0) {
+      Remove-Item $keys.Private, "$($keys.Private).pub" -Force -ErrorAction SilentlyContinue
+      Fail "The generated key is passphrase-protected, which would prompt during the interview. The key has been deleted. Generate it by hand and re-run -Setup:`n        ssh-keygen -t ed25519 -C $comment -f `"$($keys.Private)`"`n        (press Enter twice when asked for a passphrase)"
+    }
+    Write-Ok "$($keys.Private) (comment: $comment, no passphrase)"
+  }
 
   Write-Step "Pinning github.com host key"
   # Verify before trusting. ssh-keyscan alone is trust-on-first-use; comparing
   # the fingerprint to a published value is what makes it a real check.
-  $scanned = & ssh-keyscan -t $PinnedKeyType github.com 2>$null |
-             Where-Object { $_ -and -not $_.StartsWith('#') }
-  if (-not $scanned) { Fail "ssh-keyscan returned nothing. Check outbound access to github.com on port 22." }
+  $scan = Invoke-Native -Command 'ssh-keyscan' -Arguments @('-t', $PinnedKeyType, 'github.com')
+  # Keep only real host-key lines. The "#" lines are ssh-keyscan's banner, which
+  # it writes to stderr even on success, and are not an error.
+  $scanned = @($scan.Lines | Where-Object { $_ -and -not $_.StartsWith('#') })
+  if ($scanned.Count -eq 0) {
+    Fail "ssh-keyscan returned no host key. Check outbound access to github.com on port 22 (a proxy or firewall blocking 22 is the usual cause). Output was:`n        $($scan.Lines -join "`n        ")"
+  }
 
   $tmp = New-TemporaryFile
   try {
     Set-Content -Path $tmp -Value $scanned -Encoding ascii
-    $fpLine = (& ssh-keygen -lf $tmp | Select-Object -First 1)
-    $actual = ($fpLine -split '\s+')[1]
+    $fp = Invoke-Native -Command 'ssh-keygen' -Arguments @('-lf', "$tmp")
+    $fpLine = @($fp.Lines | Where-Object { $_ -match 'SHA256:' })[0]
+    if (-not $fpLine) {
+      Fail "Could not read a fingerprint from the scanned host key. ssh-keygen said:`n        $($fp.Lines -join "`n        ")"
+    }
+    $actual = ($fpLine -split '\s+' | Where-Object { $_ -like 'SHA256:*' })[0]
     $expected = $ExpectedFingerprints[$PinnedKeyType]
     if ($actual -ne $expected) {
       Fail "Host key fingerprint mismatch for github.com.`n        expected $expected`n        got      $actual`n        Do NOT continue. Either GitHub rotated its key (check its published fingerprints page and update this script) or the connection is being intercepted."
@@ -191,6 +286,26 @@ $EndMarker
   Add-Content -Path $ConfigPath -Value $block -Encoding ascii
   Lock-ToCurrentUser $ConfigPath
   Write-Ok "$ConfigPath"
+
+  Write-Step "Checking for a conflicting git ssh override"
+  # core.sshCommand replaces git's ssh invocation wholesale, so a leftover one
+  # pointing at a different key silently wins over the config block above. It is
+  # also the shortcut an operator in a hurry reaches for, and -Revoke used not to
+  # clear it.
+  $sshOverride = (Invoke-Native -Command 'git' -Arguments @('config', '--global', '--get', 'core.sshCommand')).Lines |
+                 Where-Object { $_ } | Select-Object -First 1
+  if ($sshOverride) {
+    if ($sshOverride -like "*$($keys.Private -replace '\\','/')*" -or $sshOverride -like "*$(Split-Path $keys.Private -Leaf)*") {
+      Write-Ok "core.sshCommand already points at this key; leaving it (revoke clears it)"
+    } else {
+      Write-Warn2 "git core.sshCommand is set and does NOT reference this key:"
+      Write-Host  "        $sshOverride"
+      Write-Warn2 "It overrides the config block written above. Clear it before the interview:"
+      Write-Host  "        git config --global --unset core.sshCommand"
+    }
+  } else {
+    Write-Ok "none set"
+  }
 
   if ($CandidateName -and $CandidateEmail) {
     Write-Step "Setting git commit identity"
@@ -285,8 +400,21 @@ function Invoke-Revoke {
   }
 
   if (Test-Path $KnownHosts) {
-    & ssh-keygen -R github.com 2>$null | Out-Null
+    Invoke-Native -Command 'ssh-keygen' -Arguments @('-R', 'github.com') | Out-Null
     Write-Ok "unpinned github.com from $KnownHosts"
+  }
+
+  # Clear a core.sshCommand override if it points at this candidate's key. It
+  # lives in the global git config, outside both the SSH config and
+  # CLAUDE_CONFIG_DIR, so nothing else in the wipe would catch it.
+  $sshOverride = (Invoke-Native -Command 'git' -Arguments @('config', '--global', '--get', 'core.sshCommand')).Lines |
+                 Where-Object { $_ } | Select-Object -First 1
+  if ($sshOverride -and ($sshOverride -like "*$(Split-Path $keys.Private -Leaf)*")) {
+    Invoke-Native -Command 'git' -Arguments @('config', '--global', '--unset', 'core.sshCommand') | Out-Null
+    Write-Ok "cleared git core.sshCommand, which referenced this key"
+  } elseif ($sshOverride) {
+    Write-Warn2 "git core.sshCommand is set but references another key; left alone:"
+    Write-Host  "        $sshOverride"
   }
 
   Write-Host ""
